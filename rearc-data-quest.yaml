@@ -1,0 +1,650 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Rearc Data Quest - Fixed Circular Dependencies'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name (dev, staging, prod)'
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 900
+    Description: 'Lambda timeout in seconds (max 15 minutes)'
+
+Resources:
+  # SQS Queue for processing notifications
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-processing-queue-${Environment}'
+      VisibilityTimeout: 960
+      MessageRetentionPeriod: 1209600  # 14 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessingDLQ.Arn
+        maxReceiveCount: 3
+
+  # Dead Letter Queue
+  ProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-processing-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # S3 Bucket for storing data (no notification initially)
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-data-bucket-${Environment}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # IAM Role for Data Collection Lambda
+  DataCollectionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-data-collection-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:HeadObject
+                Resource: !Sub 'arn:aws:s3:::${DataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+
+  # IAM Role for Processing Trigger Lambda
+  ProcessingTriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-processing-trigger-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt ProcessingQueue.Arn
+
+  # IAM Role for Data Analysis Lambda
+  DataAnalysisLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-data-analysis-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Ref DataBucket
+                  - !Sub '${DataBucket}/*'
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ProcessingQueue.Arn
+
+  # Lambda Function for Data Collection (Parts 1 & 2)
+  DataCollectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-data-collection-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DataCollectionLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 512
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataBucket
+          PREFIX: 'rearc-data-quest-2/'
+      Code:
+        ZipFile: |
+          import boto3
+          import requests
+          import hashlib
+          import json
+          import os
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin
+          
+          def lambda_handler(event, context):
+              print("Starting data collection process...")
+              
+              # Configuration
+              source_url = "https://download.bls.gov/pub/time.series/pr/"
+              api_url = "https://datausa.io/api/data?drilldowns=Nation&measures=Population"
+              bucket_name = os.environ['BUCKET_NAME']
+              prefix = os.environ['PREFIX']
+              
+              s3 = boto3.client('s3')
+              
+              try:
+                  # Setup session with headers
+                  session = requests.Session()
+                  session.headers.update({
+                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                      "Accept-Encoding": "gzip, deflate, br",
+                      "Accept-Language": "en-US,en;q=0.5",
+                      "Connection": "keep-alive",
+                  })
+                  
+                  # Part 1: Download BLS files
+                  print("Fetching BLS file list...")
+                  resp = session.get(source_url)
+                  resp.raise_for_status()
+                  
+                  soup = BeautifulSoup(resp.text, "html.parser")
+                  files = []
+                  
+                  for link in soup.find_all("a", href=True):
+                      href = link["href"]
+                      if href.startswith("/pub/time.series/pr/") and not href.endswith("/"):
+                          filename = href.split("/")[-1]
+                          files.append(filename)
+                  
+                  print(f"Found {len(files)} files to process")
+                  
+                  # Download and upload BLS files
+                  for filename in files:
+                      file_url = urljoin(source_url, filename)
+                      
+                      print(f"Processing {filename}...")
+                      
+                      # Download file
+                      with session.get(file_url, stream=True) as r:
+                          r.raise_for_status()
+                          file_content = r.content
+                      
+                      # Compute MD5
+                      local_md5 = hashlib.md5(file_content).hexdigest()
+                      
+                      # Check if file exists and is same
+                      try:
+                          obj = s3.head_object(Bucket=bucket_name, Key=prefix + filename)
+                          s3_etag = obj["ETag"].strip('"')
+                          if s3_etag == local_md5:
+                              print(f"File {filename} unchanged, skipping...")
+                              continue
+                      except s3.exceptions.ClientError as e:
+                          if e.response["Error"]["Code"] != "404":
+                              raise
+                      
+                      # Upload to S3
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key=prefix + filename,
+                          Body=file_content
+                      )
+                      print(f"Uploaded {filename}")
+                  
+                  # Part 2: Download API data
+                  print("Downloading population data...")
+                  resp = session.get(api_url)
+                  resp.raise_for_status()
+                  api_data = resp.json()
+                  
+                  api_content = json.dumps(api_data, indent=2).encode('utf-8')
+                  api_md5 = hashlib.md5(api_content).hexdigest()
+                  
+                  # Check if API file exists and is same
+                  api_filename = "population_data.json"
+                  try:
+                      obj = s3.head_object(Bucket=bucket_name, Key=prefix + api_filename)
+                      s3_etag = obj["ETag"].strip('"')
+                      if s3_etag == api_md5:
+                          print("Population data unchanged, skipping...")
+                      else:
+                          raise Exception("Different content")
+                  except:
+                      # Upload API data
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key=prefix + api_filename,
+                          Body=api_content,
+                          ContentType='application/json'
+                      )
+                      print("Uploaded population data")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Data collection completed successfully',
+                          'files_processed': len(files),
+                          'api_data_updated': True
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise e
+
+  # Lambda Function for Processing Trigger (S3 to SQS)
+  ProcessingTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-processing-trigger-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessingTriggerLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ProcessingQueue
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          
+          def lambda_handler(event, context):
+              print("Processing S3 trigger event...")
+              
+              sqs = boto3.client('sqs')
+              queue_url = os.environ['QUEUE_URL']
+              
+              try:
+                  # Process S3 event
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = record['s3']['object']['key']
+                      
+                      print(f"Processing S3 event for {bucket}/{key}")
+                      
+                      # Send message to SQS
+                      message_body = {
+                          'bucket': bucket,
+                          'key': key,
+                          'eventName': record['eventName'],
+                          'eventTime': record['eventTime']
+                      }
+                      
+                      sqs.send_message(
+                          QueueUrl=queue_url,
+                          MessageBody=json.dumps(message_body),
+                          MessageAttributes={
+                              'bucket': {
+                                  'StringValue': bucket,
+                                  'DataType': 'String'
+                              },
+                              'key': {
+                                  'StringValue': key,
+                                  'DataType': 'String'
+                              }
+                          }
+                      )
+                      
+                      print(f"Message sent to SQS for {key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Messages sent to SQS successfully')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise e
+
+  # Lambda Function for Data Analysis (Part 3)
+  DataAnalysisFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-data-analysis-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DataAnalysisLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 1024
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataBucket
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import csv
+          import io
+          from collections import defaultdict
+          import statistics
+          
+          def lambda_handler(event, context):
+              print("Starting data analysis...")
+              
+              s3 = boto3.client('s3')
+              bucket_name = os.environ['BUCKET_NAME']
+              
+              try:
+                  # Process SQS messages
+                  for record in event['Records']:
+                      message_body = json.loads(record['body'])
+                      bucket = message_body['bucket']
+                      key = message_body['key']
+                      
+                      print(f"Processing analysis for {bucket}/{key}")
+                      
+                      # Load population data
+                      pop_response = s3.get_object(Bucket=bucket, Key=key)
+                      pop_data = json.loads(pop_response['Body'].read())
+                      
+                      # Load time series data
+                      ts_key = key.replace('population_data.json', 'pr.data.0.Current')
+                      try:
+                          ts_response = s3.get_object(Bucket=bucket, Key=ts_key)
+                          ts_content = ts_response['Body'].read().decode('utf-8')
+                      except:
+                          print(f"Time series file not found: {ts_key}")
+                          continue
+                      
+                      # Parse time series data
+                      ts_data = []
+                      csv_reader = csv.DictReader(io.StringIO(ts_content), delimiter='\t')
+                      for row in csv_reader:
+                          # Clean whitespace from keys and values
+                          clean_row = {k.strip(): v.strip() for k, v in row.items()}
+                          ts_data.append(clean_row)
+                      
+                      # Task 1: Population statistics (2013-2018)
+                      print("=== Task 1: Population Statistics (2013-2018) ===")
+                      population_2013_2018 = []
+                      for item in pop_data['data']:
+                          year = item['ID Year']
+                          if 2013 <= year <= 2018:
+                              population_2013_2018.append(item['Population'])
+                      
+                      if population_2013_2018:
+                          mean_pop = statistics.mean(population_2013_2018)
+                          std_pop = statistics.stdev(population_2013_2018) if len(population_2013_2018) > 1 else 0
+                          print(f"Mean Population (2013-2018): {mean_pop:,.0f}")
+                          print(f"Standard Deviation: {std_pop:,.0f}")
+                          print(f"Years included: {len(population_2013_2018)}")
+                      
+                      # Task 2: Best year for each series
+                      print("\n=== Task 2: Best Year Analysis ===")
+                      series_yearly_sums = defaultdict(lambda: defaultdict(float))
+                      
+                      for row in ts_data:
+                          try:
+                              series_id = row['series_id']
+                              year = int(row['year'])
+                              value = float(row['value'])
+                              series_yearly_sums[series_id][year] += value
+                          except (ValueError, KeyError):
+                              continue
+                      
+                      best_years = {}
+                      for series_id, yearly_data in series_yearly_sums.items():
+                          best_year = max(yearly_data.items(), key=lambda x: x[1])
+                          best_years[series_id] = best_year
+                      
+                      # Show top 10 results
+                      print("Top 10 Best Years by Series:")
+                      for i, (series_id, (year, value)) in enumerate(list(best_years.items())[:10]):
+                          print(f"{series_id}: {year} (sum: {value})")
+                      
+                      print(f"Total series analyzed: {len(best_years)}")
+                      
+                      # Task 3: Combined report for PRS30006032, Q01
+                      print("\n=== Task 3: Combined Report for PRS30006032, Q01 ===")
+                      target_series = "PRS30006032"
+                      target_period = "Q01"
+                      
+                      # Create population lookup
+                      pop_lookup = {item['ID Year']: item['Population'] for item in pop_data['data']}
+                      
+                      # Filter and combine data
+                      combined_data = []
+                      for row in ts_data:
+                          if (row.get('series_id') == target_series and 
+                              row.get('period') == target_period):
+                              try:
+                                  year = int(row['year'])
+                                  value = float(row['value'])
+                                  population = pop_lookup.get(year, 'N/A')
+                                  
+                                  combined_data.append({
+                                      'series_id': target_series,
+                                      'year': year,
+                                      'period': target_period,
+                                      'value': value,
+                                      'population': population
+                                  })
+                              except (ValueError, KeyError):
+                                  continue
+                      
+                      # Sort by year and display
+                      combined_data.sort(key=lambda x: x['year'])
+                      
+                      print(f"Combined report for {target_series}, {target_period}:")
+                      print("Year | Value | Population")
+                      print("-" * 40)
+                      for item in combined_data:
+                          pop_str = f"{item['population']:,}" if item['population'] != 'N/A' else 'N/A'
+                          print(f"{item['year']} | {item['value']} | {pop_str}")
+                      
+                      print(f"Total records: {len(combined_data)}")
+                      
+                      print(f"\nAnalysis completed for {key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Analysis completed successfully')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in analysis: {str(e)}")
+                  raise e
+
+  # EventBridge Rule for daily scheduling
+  DailyScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-daily-schedule-${Environment}'
+      Description: 'Trigger data collection daily'
+      ScheduleExpression: 'cron(0 6 * * ? *)'  # Daily at 6 AM UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DataCollectionFunction.Arn
+          Id: 'DataCollectionTarget'
+
+  # Event Source Mapping for SQS to DataAnalysisFunction
+  SQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ProcessingQueue.Arn
+      FunctionName: !GetAtt DataAnalysisFunction.Arn
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 5
+
+  # Permission for EventBridge to invoke DataCollectionFunction
+  EventBridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DataCollectionFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyScheduleRule.Arn
+
+  # Permission for S3 to invoke ProcessingTriggerFunction
+  ProcessingTriggerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ProcessingTriggerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt DataBucket.Arn
+
+  # Custom Resource to configure S3 bucket notification
+  S3NotificationConfiguration:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt S3NotificationLambda.Arn
+      BucketName: !Ref DataBucket
+      LambdaFunctionArn: !GetAtt ProcessingTriggerFunction.Arn
+      NotificationId: !Ref ProcessingTriggerInvokePermission
+
+  # Lambda function to configure S3 bucket notification
+  S3NotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-s3-notification-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt S3NotificationLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  s3 = boto3.client('s3')
+                  
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  lambda_arn = event['ResourceProperties']['LambdaFunctionArn']
+                  
+                  if event['RequestType'] == 'Delete':
+                      # Remove the notification configuration
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket_name,
+                          NotificationConfiguration={}
+                      )
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Add the notification configuration
+                  s3.put_bucket_notification_configuration(
+                      Bucket=bucket_name,
+                      NotificationConfiguration={
+                          'LambdaConfigurations': [
+                              {
+                                  'Id': 'ProcessingTrigger',
+                                  'LambdaFunctionArn': lambda_arn,
+                                  'Events': ['s3:ObjectCreated:*'],
+                                  'Filter': {
+                                      'Key': {
+                                          'FilterRules': [
+                                              {'Name': 'prefix', 'Value': 'rearc-data-quest-2/'},
+                                              {'Name': 'suffix', 'Value': 'population_data.json'}
+                                          ]
+                                      }
+                                  }
+                              }
+                          ]
+                      }
+                  )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM Role for S3 notification Lambda
+  S3NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3NotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !GetAtt DataBucket.Arn
+
+Outputs:
+  DataBucketName:
+    Description: 'Name of the S3 data bucket'
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucket'
+
+  ProcessingQueueURL:
+    Description: 'URL of the SQS processing queue'
+    Value: !Ref ProcessingQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingQueue'
+
+  DataCollectionFunctionName:
+    Description: 'Name of the data collection Lambda function'
+    Value: !Ref DataCollectionFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-DataCollectionFunction'
+
+  DataAnalysisFunctionName:
+    Description: 'Name of the data analysis Lambda function'
+    Value: !Ref DataAnalysisFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-DataAnalysisFunction'
+
+  DailyScheduleRuleName:
+    Description: 'Name of the EventBridge rule for daily scheduling'
+    Value: !Ref DailyScheduleRule
+    Export:
+      Name: !Sub '${AWS::StackName}-DailyScheduleRule'
